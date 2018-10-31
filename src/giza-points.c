@@ -28,6 +28,7 @@
 #include "giza-io-private.h"
 #include <giza.h>
 #include <math.h>
+#include <stddef.h> /* for NULL */
 
 /* Internal functions */
 static void _giza_point        (double x, double y);
@@ -51,6 +52,25 @@ static void _giza_draw_symbol (double xd, double yd, int symbol);
 
 /* Stores the height of the markers */
 static double markerHeight;
+
+
+/* Set aside some memory (4kB) for batch converting world to device coordinates
+ * so as not to have switch to and from transformations at every symbol
+ */
+typedef struct _internal_point_type {
+    double  xd, yd;
+} internal_point_type;
+int const                   nPointBuff = (4096 / sizeof(internal_point_type));
+static internal_point_type  pointBuff[ nPointBuff ];
+
+/* since this code is not C++ there's no standard
+ * min/max function in the library.
+ * Implemented as function per https://stackoverflow.com/a/3437484
+ * because that IS the right answer.
+ */
+int max_ab_int(int a, int b) {
+    return (a > b ? a : b);
+}
 
 /**
  * Drawing: giza_points
@@ -88,22 +108,29 @@ giza_points (int n, const double* x, const double* y, int symbol)
   _giza_start_draw_symbols (&oldTrans,&oldLineStyle,&oldLineCap,&oldLineWidth,&oldCh);
 
   /* for each point find where to put each marker */
-  int i;
-  double xd, yd;
-  for (i = 0; i < n; i++)
-    {
-      /* convert world coords to device coords */
+  int i = 0;
+  while( i < n ) {
+      int       j;
+      const int nItem = max_ab_int( n-i, nPointBuff );
+
+      /* batch convert world coords to device coords */
       _giza_set_trans (GIZA_TRANS_WORLD);
-      xd = x[i];
-      yd = y[i];
-      cairo_user_to_device (Dev[id].context, &xd, &yd);
+      
+      for (j = 0; j < nItem; i++, j++)
+      {
+          pointBuff[j].xd = x[i];
+          pointBuff[j].yd = y[i];
+          cairo_user_to_device (Dev[id].context, &pointBuff[j].xd, &pointBuff[j].yd);
+      }
+
       _giza_set_trans (GIZA_TRANS_IDEN);
 
-      /* draw the symbol */
-      _giza_draw_symbol(xd, yd, symbol);
+      /* batch draw the symbols */
+      for (j = 0; j < nItem; j++)
+          _giza_draw_symbol(pointBuff[j].xd, pointBuff[j].yd, symbol);
     }
 
-  _giza_stroke ();
+  /*_giza_stroke ();*/
   giza_flush_device ();
 
   /* restore old setting */
@@ -117,6 +144,49 @@ giza_points (int n, const double* x, const double* y, int symbol)
  *
  * See Also: giza_points
  */
+void
+giza_points_float (int n, const float* x, const float* y, int symbol)
+{
+  if (!_giza_check_device_ready ("giza_points"))
+    return;
+  if (n < 1) return;
+
+  int oldTrans,oldLineStyle,oldLineCap;
+  double oldLineWidth,oldCh;
+
+  /* initialise symbol drawing */
+  _giza_start_draw_symbols (&oldTrans,&oldLineStyle,&oldLineCap,&oldLineWidth,&oldCh);
+
+  /* for each point find where to put each marker */
+  int i = 0;
+  while( i < n ) {
+      int       j;
+      const int nItem = max_ab_int( n-i, nPointBuff );
+
+      /* batch convert world coords to device coords */
+      _giza_set_trans (GIZA_TRANS_WORLD);
+      
+      for (j = 0; j < nItem; i++, j++)
+      {
+          pointBuff[j].xd = x[i]; /* compiler should do automatic type promotion Just Fine (tm) */
+          pointBuff[j].yd = y[i];
+          cairo_user_to_device (Dev[id].context, &pointBuff[j].xd, &pointBuff[j].yd);
+      }
+
+      _giza_set_trans (GIZA_TRANS_IDEN);
+
+      /* batch draw the symbols */
+      for (j = 0; j < nItem; j++)
+          _giza_draw_symbol(pointBuff[j].xd, pointBuff[j].yd, symbol);
+    }
+
+  /*_giza_stroke ();*/
+  giza_flush_device ();
+
+  /* restore old setting */
+  _giza_end_draw_symbols (oldTrans,oldLineStyle,oldLineCap,oldLineWidth,oldCh);
+}
+#if 0    
 void
 giza_points_float (int n, const float* x, const float* y, int symbol)
 {
@@ -147,13 +217,14 @@ giza_points_float (int n, const float* x, const float* y, int symbol)
       _giza_draw_symbol(xd, yd, symbol);
     }
 
-  giza_end_buffer ();
+  /*giza_end_buffer ();*/
   _giza_stroke ();
   giza_flush_device ();
 
   /* restore old settings */
   _giza_end_draw_symbols (oldTrans,oldLineStyle,oldLineCap,oldLineWidth,oldCh);
 }
+#endif
 
 /**
  * Drawing: giza_single_point
@@ -394,6 +465,18 @@ _giza_draw_symbol (double xd, double yd, int symbol)
 	  break;
 	}
     }
+  /* after drawing a symbol, stroke it
+   * this may be a no-op in case the symbol drawing routing
+   * already did cairo_fill() itself, which clears the 'path'
+   * but this way the symbol drawers that simply create the symbol's
+   * path don't have to to anything other than that.
+   *
+   * Also don't use _giza_stroke() because that always sets
+   * the line style (does a lot and is expensive) but inside this
+   * routine it is impossible that the line style has changed between
+   * calls
+   */
+  cairo_stroke( Dev[id].context );
 }
 
 /**
@@ -404,7 +487,7 @@ _giza_point (double x, double y)
 {
   cairo_arc (Dev[id].context, x, y, 1.0, 0., 2.* M_PI);
   cairo_fill (Dev[id].context);
-  _giza_stroke();
+  /*_giza_stroke();*/
 }
 
 /**
@@ -429,7 +512,7 @@ _giza_plus (double x, double y)
   cairo_line_to (Dev[id].context, x + markerHeight * 0.5, y);
   cairo_move_to (Dev[id].context, x, y - markerHeight * 0.5);
   cairo_line_to (Dev[id].context, x, y + markerHeight * 0.5);
-  _giza_stroke ();
+  /*_giza_stroke ();*/
 }
 
 /**
@@ -440,7 +523,7 @@ _giza_circle (double x, double y)
 {
   cairo_move_to(Dev[id].context, x + markerHeight*0.5, y);
   cairo_arc (Dev[id].context, x, y, markerHeight * 0.5, 0., 2. * M_PI);
-  _giza_stroke ();
+  /*_giza_stroke ();*/
 }
 
 /**
@@ -452,7 +535,7 @@ _giza_circle_size (double x, double y, double size, int fill)
   cairo_move_to(Dev[id].context, x + size*markerHeight*0.5, y);
   cairo_arc (Dev[id].context, x, y, size * markerHeight * 0.5, 0., 2. * M_PI);
   if (fill) { cairo_fill(Dev[id].context); }
-  _giza_stroke ();
+  /*_giza_stroke ();*/
 }
 
 /**
@@ -466,7 +549,7 @@ _giza_triangle(double x, double y, int fill)
   cairo_line_to (Dev[id].context, x, y + markerHeight * 0.5);
   cairo_close_path (Dev[id].context);
   if (fill) { cairo_fill(Dev[id].context); }
-  _giza_stroke ();
+  /*_giza_stroke ();*/
 }
 
 /**
@@ -481,7 +564,7 @@ _giza_diamond(double x, double y, int fill)
   cairo_line_to (Dev[id].context, x, y - markerHeight * 0.625);
   cairo_close_path (Dev[id].context);
   if (fill) { cairo_fill(Dev[id].context); }
-  _giza_stroke ();
+  /*_giza_stroke ();*/
 }
 
 
@@ -497,7 +580,7 @@ _giza_cross (double x, double y)
   cairo_rel_line_to (Dev[id].context, dx, dx);
   cairo_rel_move_to (Dev[id].context, -dx, 0);
   cairo_rel_line_to (Dev[id].context, dx, -dx);
-  _giza_stroke ();
+  /*_giza_stroke ();*/
 }
 
 /**
@@ -515,9 +598,40 @@ _giza_arrow (double x, double y, double angle)
   cairo_rel_line_to (Dev[id].context, - headlength*cosa + headwidth*sina, headwidth*cosa - headlength*sina);
   cairo_move_to (Dev[id].context, x + r*cosa, y + r*sina);
   cairo_rel_line_to (Dev[id].context, - headlength*cosa - headwidth*sina, -headwidth*cosa - headlength*sina);
-  _giza_stroke ();
+  /*_giza_stroke ();*/
 }
 
+
+/* Create lookup tables for the cos/sin of the angles for drawing
+ * polygons/stars. Then when drawing the symbol the lines only have
+ * to be scaled.
+ */
+typedef struct _internal_sincos_type {
+    double  sinalpha, cosalpha;
+} internal_sincos_type;
+static int const                         maxNSides = 8; /* only up to 8 sides supported */
+static internal_sincos_type const*const* polygon_lut = NULL; 
+
+internal_sincos_type const*const* initPolygonLUT( void ) {
+    /* the lookup table */
+    static internal_sincos_type LUT[maxNSides+1][maxNSides+1];
+
+    /* loop + local variables */
+    int    i, j;
+    double alpha, alpha_step;
+
+    /* skip case i = 0 for that don't make no sense */
+    for( i = 1; i<maxNSides+1; i++ ) 
+    {
+        /* Set first vertex above marker position */
+        for(j=0, alpha=1.5*M_PI, alpha_step=(2*M_PI)/i; j < i; j++, alpha += alpha_step )
+        {
+            LUT[i][j].cosalpha = cos(alpha);
+            LUT[i][j].sinalpha = sin(alpha);
+        }
+    }
+    return (internal_sincos_type const*const*)LUT;
+}
 
 /**
  * Draws a general polygon at x, y
@@ -525,29 +639,73 @@ _giza_arrow (double x, double y, double angle)
 static void
 _giza_polygon (double x, double y, int nsides, int fill)
 {
+  if( nsides<1 || nsides>maxNSides ) {
+      _giza_error("_giza_polygon", "The code does not currently handle nsides=%d, min/max=1/%d", nsides, maxNSides);
+      return;
+  }
+ /* locate the lookup table for the vertices */
+ if( polygon_lut == NULL )
+     polygon_lut = initPolygonLUT(); 
+ internal_sincos_type const*const pLUT = polygon_lut[nsides];
+
  /* Define radius */
  double r = 0.5 * markerHeight;
 
+#if 0
  /* Set first vertex above marker position */
  double alpha = 1.5 * M_PI;
  double cosalpha = cos(alpha);
  double sinalpha = sin(alpha);
- cairo_move_to (Dev[id].context, x + r * cosalpha, y + r * sinalpha);
+#endif
+ cairo_move_to (Dev[id].context, x + r * pLUT[0].cosalpha, y + r * pLUT[0].sinalpha);
 
  /* Define other vertexes */
- double alpha_step = 2. * M_PI / ((double) nsides);
+/* double alpha_step = 2. * M_PI / ((double) nsides);*/
  int i;
  for (i = 1; i < nsides; i++)
  {
+/*
   alpha += alpha_step;
   cosalpha = cos(alpha);
-  sinalpha = sin(alpha);
-  cairo_line_to (Dev[id].context, x + r * cosalpha, y + r * sinalpha);
+  sinalpha = sin(alpha);*/
+  cairo_line_to (Dev[id].context, x + r * pLUT[i].cosalpha, y + r * pLUT[i].sinalpha);
  }
  cairo_close_path(Dev[id].context);
  if (fill) { cairo_fill(Dev[id].context); }
- _giza_stroke ();
+ /*_giza_stroke ();*/
 
+}
+
+/* repeat lookup table stuff for stars of npoints.
+ * values used I found so far: 5 and 7.
+ * When drawing a star of npoints the number of vertices needed is 2n
+ */
+static int const                         maxNStarPoints = 8; /* only up to 8 sides supported */
+static internal_sincos_type const*const* star_lut = NULL;
+
+internal_sincos_type const*const*const initStarLUT( void ) {
+    /* the lookup table */
+    static internal_sincos_type LUT[maxNStarPoints+1][2*maxNStarPoints];
+
+    /* loop + local variables */
+    int    i, j;
+    double alpha, alpha_step;
+
+    /* skip case i = 0 for that don't make no sense */
+    for( i = 1; i<maxNStarPoints+1; i++ ) 
+    {
+        /* Set first vertex so that shape appears flat-bottomed */
+        /* Note that alpha_step has already been halved compared to
+         * the original, which set "alpha_step = 2*M_PI/npoints"
+         * and then for each vertex "alpha += 0.5*alpha_step".
+         */
+        for(j=0, alpha=(0.5+1./i)*M_PI, alpha_step=M_PI/i; j<(2*i); j++, alpha+=alpha_step)
+        {
+            LUT[i][j].cosalpha = cos(alpha);
+            LUT[i][j].sinalpha = sin(alpha);
+        }
+    }
+    return (internal_sincos_type const*const*const)LUT;
 }
 
 /**
@@ -556,37 +714,53 @@ _giza_polygon (double x, double y, int nsides, int fill)
 static void
 _giza_star (double x, double y, int npoints, double ratio, int fill)
 {
- /* Define outer and inner radius */
- double r = 0.5 * markerHeight;
- double ri = ratio * r;
+  if( npoints<1 || npoints>maxNStarPoints ) {
+      _giza_error("_giza_star", "The code does not currently handle npoints=%d, min/max=1/%d", npoints, maxNStarPoints);
+      return;
+  }
+ /* locate the lookup table for the vertices */
+ if( star_lut == NULL )
+    star_lut = initStarLUT(); 
+ internal_sincos_type const*const pLUT = star_lut[npoints];
 
+ /* Define outer and inner radius */
+ double r  = 0.5 * markerHeight;
+ double ri = ratio * r;
+#if 0
  /* Set first vertex so that shape appears flat-bottomed */
  double alpha = (0.5 + 1./npoints)* M_PI;
  double cosalpha = cos(alpha);
  double sinalpha = sin(alpha);
- cairo_move_to (Dev[id].context, x + r * cosalpha, y + r * sinalpha);
+#endif
+ cairo_move_to (Dev[id].context, x + r * pLUT[0].cosalpha, y + r * pLUT[0].sinalpha);
 
  /* Define other vertexes */
- double alpha_step = 2 * M_PI / npoints;
+/* double alpha_step = 2 * M_PI / npoints;*/
  int i;
  for (i = 1; i < npoints; i++)
  {
+#if 0
   alpha += 0.5*alpha_step;
   cosalpha = cos(alpha);
   sinalpha = sin(alpha);
-  cairo_line_to (Dev[id].context, x + ri * cosalpha, y + ri * sinalpha);
+#endif
+  cairo_line_to (Dev[id].context, x + ri * pLUT[2*i-1].cosalpha, y + ri * pLUT[2*i-1].sinalpha);
+  cairo_line_to (Dev[id].context, x + r  * pLUT[2*i-0].cosalpha, y + r  * pLUT[2*i-0].sinalpha);
+#if 0
   alpha += 0.5*alpha_step;
   cosalpha = cos(alpha);
   sinalpha = sin(alpha);
-  cairo_line_to (Dev[id].context, x + r * cosalpha, y + r * sinalpha);
+#endif
  }
+#if 0
  alpha += 0.5*alpha_step;
  cosalpha = cos(alpha);
  sinalpha = sin(alpha);
- cairo_line_to (Dev[id].context, x + ri * cosalpha, y + ri * sinalpha);
+#endif
+ cairo_line_to (Dev[id].context, x + ri * pLUT[2*i-1].cosalpha, y + ri * pLUT[2*i-1].sinalpha);
  cairo_close_path(Dev[id].context);
  if (fill) { cairo_fill(Dev[id].context); }
-  _giza_stroke ();
+  /*_giza_stroke ();*/
 
 }
 
